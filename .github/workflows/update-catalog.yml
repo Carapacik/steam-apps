@@ -1,0 +1,100 @@
+name: Update Steam Catalog
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "10 0,17 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-steam-catalog
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      OUTPUT_DIR: dist
+      STEAM_WEB_API_KEY: ${{ secrets.STEAM_WEB_API_KEY }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore previous gh-pages data into dist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages:refs/remotes/origin/gh-pages
+            git worktree add --force pages-worktree origin/gh-pages
+            mkdir -p dist
+            for file in apps.all.json apps.games.json apps.dlc.json apps.software.json apps.videos.json apps.hardware.json appids.all.json manifest.json .nojekyll; do
+              if [ -f "pages-worktree/$file" ]; then
+                cp "pages-worktree/$file" "dist/$file"
+              fi
+            done
+            rm -rf pages-worktree
+            git worktree prune
+          fi
+
+          if [ ! -f dist/manifest.json ]; then
+            cargo run --release --bin bootstrap-output
+          fi
+
+      - name: Build and update catalog
+        if: env.STEAM_WEB_API_KEY != ''
+        run: cargo run --release --bin steam-apps
+
+      - name: Skip catalog fetch without Steam API key
+        if: env.STEAM_WEB_API_KEY == ''
+        run: |
+          echo "::warning title=STEAM_WEB_API_KEY is missing::Publishing the existing bootstrap catalog. Add the STEAM_WEB_API_KEY repository secret to fetch real Steam data."
+
+      - name: Validate output
+        run: cargo run --release --bin validate-output
+
+      - name: Prepare gh-pages worktree
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages:refs/remotes/origin/gh-pages
+            git worktree add --force pages-worktree origin/gh-pages
+          else
+            git worktree add --detach pages-worktree HEAD
+            (
+              cd pages-worktree
+              git checkout --orphan gh-pages
+              find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+            )
+          fi
+
+          cp -R dist/. pages-worktree/
+
+      - name: Commit gh-pages branch if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd pages-worktree
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          if git diff --cached --quiet; then
+            echo "No gh-pages changes to commit."
+          else
+            git commit -m "Update Steam catalog"
+            git push origin HEAD:gh-pages
+          fi
